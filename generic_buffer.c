@@ -129,12 +129,13 @@ int main(int argc, char **argv)
 	int fp;
 
 	int num_channels;
-	char *device_name = NULL;
+	char *trigger_name = NULL, *device_name = NULL;
 	char *dev_dir_name, *buf_dir_name;
 
+	int datardytrigger = 1;
 	char *data;
 	ssize_t read_size;
-	int dev_num;
+	int dev_num, trig_num;
 	char *buffer_access;
 	int scan_size;
 	int noevents = 0;
@@ -146,6 +147,10 @@ int main(int argc, char **argv)
 		switch (c) {
 		case 'n':
 			device_name = optarg;
+			break;
+		case 't':
+			trigger_name = optarg;
+			datardytrigger = 0;
 			break;
 		case 'e':
 			noevents = 1;
@@ -177,6 +182,28 @@ int main(int argc, char **argv)
 	printf("iio device number being used is %d\n", dev_num);
 
 	asprintf(&dev_dir_name, "%siio:device%d", iio_dir, dev_num);
+	if (trigger_name == NULL) {
+		/*
+		 * Build the trigger name. If it is device associated it's
+		 * name is <device_name>_dev[n] where n matches the device
+		 * number found above
+		 */
+		ret = asprintf(&trigger_name,
+			       "%s-dev%d", device_name, dev_num);
+		if (ret < 0) {
+			ret = -ENOMEM;
+			goto error_ret;
+		}
+	}
+
+	/* Verify the trigger exists */
+	trig_num = find_type_by_name(trigger_name, "trigger");
+	if (trig_num < 0) {
+		printf("Failed to find the trigger %s\n", trigger_name);
+		ret = -ENODEV;
+		goto error_free_triggername;
+	}
+	printf("iio trigger number being used is %d\n", trig_num);
 
 	/*
 	 * Parse the files in scan_elements to identify what channels are
@@ -186,7 +213,7 @@ int main(int argc, char **argv)
 	if (ret) {
 		printf("Problem reading scan element information\n");
 		printf("diag %s\n", dev_dir_name);
-		goto error_ret;
+		goto error_free_triggername;
 	}
 
 	/*
@@ -198,22 +225,38 @@ int main(int argc, char **argv)
 		       "%siio:device%d/buffer", iio_dir, dev_num);
 	if (ret < 0) {
 		ret = -ENOMEM;
-		goto error_ret;
+		goto error_free_triggername;
 	}
-	printf("%s \n", dev_dir_name);
+	printf("%s %s\n", dev_dir_name, trigger_name);
+	/* Set the device trigger to be the data rdy trigger found above */
+	ret = write_sysfs_string_and_verify("trigger/current_trigger",
+					dev_dir_name,
+					trigger_name);
+	if (ret < 0) {
+		printf("Failed to write current_trigger file\n");
+		goto error_free_buf_dir_name;
+	}
+
 	/* Setup ring buffer parameters */
 	ret = write_sysfs_int("length", buf_dir_name, buf_len);
 	if (ret < 0)
 		goto error_free_buf_dir_name;
+
 	/* Enable the buffer */
 	ret = write_sysfs_int("enable", buf_dir_name, 1);
 	if (ret < 0)
 		goto error_free_buf_dir_name;
+	scan_size = size_from_channelarray(infoarray, num_channels);
+	data = malloc(scan_size*buf_len);
+	if (!data) {
+		ret = -ENOMEM;
+		goto error_free_buf_dir_name;
+	}
 
 	ret = asprintf(&buffer_access, "/dev/iio:device%d", dev_num);
 	if (ret < 0) {
 		ret = -ENOMEM;
-		goto error_free_buf_dir_name;
+		goto error_free_data;
 	}
 
 	/* Attempt to open non blocking the access dev */
@@ -221,28 +264,36 @@ int main(int argc, char **argv)
 	if (fp == -1) { /*If it isn't there make the node */
 		printf("Failed to open %s\n", buffer_access);
 		ret = -errno;
-		goto error_free_buf_dir_name;
-	}
-
-	scan_size = size_from_channelarray(infoarray, num_channels);
-	data = malloc(scan_size*buf_len);
-	if (!data) {
-		ret = -ENOMEM;
-		goto error_close_buffer_access;
+		goto error_free_buffer_access;
 	}
 
 	/* Wait for events 10 times */
 	for (j = 0; j < num_loops; j++) {
-		usleep(timedelay);
+		if (!noevents) {
+			struct pollfd pfd = {
+				.fd = fp,
+				.events = POLLIN,
+			};
+
+			poll(&pfd, 1, -1);
+			toread = buf_len;
+
+		} else {
+			usleep(timedelay);
+			toread = 64;
+		}
+
 		read_size = read(fp,
 				 data,
-				 buf_len*scan_size);
+				 toread*scan_size);
 		if (read_size == -EAGAIN) {
 			printf("nothing available\n");
 			continue;
 		}
-		for (i = 0; i < read_size/4; i++, data+=4)
-			printf("ADC Value: %d\n", *(long*)data);
+		for (i = 0; i < read_size/scan_size; i++)
+			process_scan(data + scan_size*i,
+				     infoarray,
+				     num_channels);
 	}
 
 	/* Stop the ring buffer */
@@ -250,10 +301,21 @@ int main(int argc, char **argv)
 	if (ret < 0)
 		goto error_close_buffer_access;
 
+	/* Disconnect from the trigger - just write a dummy name.*/
+	write_sysfs_string("trigger/current_trigger",
+			dev_dir_name, "NULL");
+
 error_close_buffer_access:
 	close(fp);
+error_free_data:
+	free(data);
+error_free_buffer_access:
+	free(buffer_access);
 error_free_buf_dir_name:
 	free(buf_dir_name);
+error_free_triggername:
+	if (datardytrigger)
+		free(trigger_name);
 error_ret:
 	return ret;
 }
