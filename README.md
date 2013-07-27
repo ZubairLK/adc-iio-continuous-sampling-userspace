@@ -17,3 +17,4 @@ or
 <path_to_cross-compiler/cross-compiler-prefix->-gcc --static generic_buffer.c -o generic_buffer
 
 Check the blog post for more details on how to use this application
+http://beagleboard-gsoc13.blogspot.com/2013/07/sampling-analogue-signals-using-adc-on.html
